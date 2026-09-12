@@ -83,123 +83,106 @@ from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
-# 继承nn.Module类
+
+# 继承nn.Module类，定义MokioMind模型的结构和前向传播逻辑。
 class RMSNorm(nn.Module):
-# __init__初始化
-    def __init__(self, dim:int, eps:float=1e-5):
-        super().__init__()
+# __init__方法用于初始化模型的参数和层，forward方法定义了模型的前向传播过程。
+    def __init__(self,dim:int,eps:float=1e-6):
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))  # 初始化权重参数为全1张量
+        self.weight = nn.Parameter(torch.ones(dim))
+# norm
+    def _norm(self,x):
+        return x*torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)
+# forward方法接受输入数据并通过模型的层进行处理，最终输出模型的预测结果。
+    def forward(self,x):
+        return self.weight*self._norm(x.float()).type_as(x)*x
 
-# _norm
-    def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
-    
-# forward
-    def forward(self, x):
-        return self.weight * self._norm(x.float()).type_as(x) * x
-
-def precomput_freqs_cls(
-    dim: int,
-    end: int = 32 * 1024,
-    rope_base: float = 10000.0,
-    rope_scaling: Optional[dict] = None,
-):
-    # 基础频率：形状 [dim // 2]
-    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+def precomput_freqs_cls(dim:int,end:int = int(32*1024),rope_base:float = 1e6,rope_scaling:Optional[dict] = None):
+#写出最开始的ROPE
+    freqs = 1.0/(rope_base**(torch.arange(0,dim,2)[:dim//2].float() / dim))
 
     if rope_scaling is not None:
-        orig_max = rope_scaling.get("original_max_position_embeddings", 32768)
-        factor = rope_scaling.get("factor", 1.0)
-        beta_fast = rope_scaling.get("beta_fast", 32)
-        beta_slow = rope_scaling.get("beta_slow", 1)
-
-        if end > orig_max:
-            # 波长 b 到维度索引的映射
-            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
-
-            # 划分高低频段
-            low = max(math.floor(inv_dim(beta_fast)), 0)
-            high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
-
-            # 线性插值缩放因子
-            ramp = torch.clamp(
-                (torch.arange(dim // 2, device=freqs.device).float() - low)
-                / max(high - low, 1),
-                min=0.0,
-                max=1.0,
-            )
-            # 高频不变，低频缩放
-            freqs = freqs * (1 - ramp + ramp / factor)
-
-    # 位置索引
-    t = torch.arange(end, device=freqs.device).float()
-
-    # 外积：每个位置的旋转角度
-    freqs = torch.outer(t, freqs).float()
-
-    # 拼接成两倍维度（因为旋转需要 cos/sin 各一份）
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
-
-    return freqs_cos, freqs_sin
-
-#编写RoPE
-# 编写RoPE
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    def rotate_half(x):
-        # x.shape[-1]取最后一个维度的重点
-        # x[..., x.shape[-1] // 2 :]取出x的后半部分
-        return torch.cat(
-            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 1), 
+            rope_scaling.get("beta_fast", 4),
+            rope_scaling.get("beta_slow", 1),
         )
-    
-    # x_rotated = x * cos + rotate_half(x) * sin
-    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
-    )
-    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
-    )
-    
-    return q_embed, k_embed
+        
+        if end / orig_max > 1.0:
+# 计算corr_dim
+            corr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max), dim//2)
+    # 计算power
+            power = torch.arange(0,dim//2,device = freqs.device).float()/(max(dim//2-1,1))
+    # 计算beta
+            beta = beta_slow + (beta_fast-beta_slow)*power
+    # 计算scale
+            scale = torch.where(
+                torch.arange(0,dim//2,device = freqs.device) < corr_dim,
+                (beta * factor - beta + 1)/(beta * factor),
+                1.0/factor,
+            )
+    # 应用scale
+            freqs = freqs*scale
+#生成位置索引，与频域相乘
+    t = torch.arange(end, device=freqs.device).float()
+    freqs = torch.outer(t,freqs).float()
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    bs, slen, num_key_value_heads, head_dim = x.shape
+# 返回一个cos和sin
+    freqs_cos = torch.cat([torch.cos(freqs),torch.cos(freqs)],dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs),torch.sin(freqs)],dim=-1)
+    return freqs_cos,freqs_sin
+
+def apply_rotary_pos_emb(q,k,cos,sin,unsqueeze_dim = 1):
+    #x.shape[-1]：获取张量 x 在最后一个维度上的大小（长度）。
+    #x[..., :half]：选取张量最后一个维度的前半部分。... 表示保留前面所有维度的结构不变。
+    #x[..., half:]：选取张量最后一个维度的后半部分
+    #torch.cat([...], dim=-1)：将处理后的后半部分（取负后）和原始的前半部分在最后一个维度上进行拼接。
+    def rotate_half(x):
+        return torch.cat([-x[..., x.shape[-1]//2:], x[..., :x.shape[-1]//2]], dim=-1)
+    #应用旋转位置编码到查询和键上,x_rotated = x*cos + rotate_half(x)*sin
+    #unsqueeze_dim用于后续维度扩展，使得cos和sin能够正确地广播到q和k的形状上。
+    q_embed = (q*cos.unsqueeze(unsqueeze_dim) + rotate_half(q)*sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k*cos.unsqueeze(unsqueeze_dim) + rotate_half(k)*sin.unsqueeze(unsqueeze_dim))
+    return q_embed,k_embed
+
+def repeat_kv(x:torch.Tensor,n_rep:int)->torch.Tensor:
+    bs,slen,num_value_heads,head_dim = x.shape
     if n_rep == 1:
         return x
-
+    
     return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
-        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+        x[:,:,:,None,:].expand(bs,slen,num_value_heads,n_rep,head_dim).reshape(bs,slen,num_value_heads*n_rep,head_dim)
     )
 
 class Attention(nn.Module):
-    def __init__(self, args: MokioMindConfig):
+    def __init__(self, args:MokioMindConfig):
         super().__init__()
 
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
-
-        assert args.num_attention_heads % self.num_key_value_heads == 0, \
+        self.num_key_value_heads = (
+            args.num_attention_heads 
+            if args.num_key_value_heads is None 
+            else args.num_key_value_heads
+        )
+        assert args.num_attention_heads % self.num_key_value_heads == 0, (
             "num_attention_heads must be divisible by num_key_value_heads"
+        )
 
-        self.n_local_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
-        self.n_rep = self.n_local_heads // self.num_key_value_heads
-        self.head_dim = args.hidden_size // args.num_attention_heads
+        self.n_local_heads = args.num_attention_heads 
+        self.n_rep = self.n_local_heads//self.num_key_value_heads #每个token的专家数量 4
+        self.head_dim = args.hidden_size//args.num_attention_heads #64
 
-        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        self.q_proj = nn.Linear(args.hidden_size,args.num_attention_heads*self.head_dim,bias=False)
+        self.k_proj = nn.Linear(args.hidden_size,args.num_attention_heads*self.head_dim,bias=False)
+        self.v_proj = nn.Linear(args.hidden_size,args.num_attention_heads*self.head_dim,bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads*self.head_dim,args.hidden_size,bias=False)
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
-        self.dropout = args.dropout
+        self.droppath = args.dropout
 
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
+        self.flash_attention = hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
 
     def forward(self,
                 x:torch.Tensor,
@@ -291,7 +274,6 @@ class FeedForward(nn.Module):
         return self.dropout(self.down_proj(self.act_fn(gated)))
 
 
-
 class MokioMindBlock(nn.Module):
     def __init__(self,Layer_id:int,config:MokioMindConfig):
         super().__init__()
@@ -317,7 +299,7 @@ class MokioMindBlock(nn.Module):
         hidden_states = residual+hidden_states
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states,present_key_value
-
+    
 class MokioMindModel(nn.Module):
     def __init__(self,config:MokioMindConfig):
         super().__init__()
@@ -392,7 +374,7 @@ class MokioMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states,presents
-
+    
 class MokioMindForCausalLM(PreTrainedModel,GenerationMixin):
     config_class  = MokioMindConfig
 
@@ -441,3 +423,12 @@ class MokioMindForCausalLM(PreTrainedModel,GenerationMixin):
             past_key_values=past_key_values,
             hidden_states=hidden_states,
         )
+    
+        
+
+
+            
+            
+
+        
+        
