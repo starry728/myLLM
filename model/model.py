@@ -100,7 +100,7 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x) * x
 
-def precompute_freqs_cis(
+def precomput_freqs_cls(
     dim: int,
     end: int = 32 * 1024,
     rope_base: float = 10000.0,
@@ -392,3 +392,52 @@ class MokioMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states,presents
+
+class MokioMindForCausalLM(PreTrainedModel,GenerationMixin):
+    config_class  = MokioMindConfig
+
+    def __init__(self,config:MokioMindConfig):
+        self.config = config
+
+        super().__init__(config)
+
+        self.model = MokioMindModel(config)
+
+        self.lm_head = nn.Linear(self.config.hidden_size,self.config.vocab_size,bias=False)
+
+#权重共享
+#将语言模型头的权重与嵌入层的权重共享，使得它们使用相同的参数进行计算。这种权重共享可以减少模型的参数数量，提高训练效率，并且在某些情况下可以提升模型的性能。
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+
+
+    def forward(
+            self,
+            input_ids:Optional[torch.Tensor]=None,
+            attention_mask:Optional[torch.Tensor]=None,
+            past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None,
+            use_cache:bool=False,
+            logits_to_keep:Union[int, torch.Tensor]=0,
+            **args
+    ):
+        hidden_states,past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+        #logits  to keep 是整数，那就保留最后n个位置
+        #生成时只需要最后的logits_to_keep个位置的logits，其他位置的logits可以被忽略或设置为负无穷，以避免对生成结果产生影响。
+        slice_indices = (
+            slice(-logits_to_keep, None) 
+            if isinstance(logits_to_keep, int) 
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:,slice_indices,:])
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
