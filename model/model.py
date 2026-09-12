@@ -77,6 +77,8 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+import math
+from typing import Optional
 # 继承nn.Module类
 class RMSNorm(nn.Module):
 # __init__初始化
@@ -93,3 +95,68 @@ class RMSNorm(nn.Module):
 # forward
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x) * x
+
+def precompute_freqs_cis(
+    dim: int,
+    end: int = 32 * 1024,
+    rope_base: float = 10000.0,
+    rope_scaling: Optional[dict] = None,
+):
+    # 基础频率：形状 [dim // 2]
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+
+    if rope_scaling is not None:
+        orig_max = rope_scaling.get("original_max_position_embeddings", 32768)
+        factor = rope_scaling.get("factor", 1.0)
+        beta_fast = rope_scaling.get("beta_fast", 32)
+        beta_slow = rope_scaling.get("beta_slow", 1)
+
+        if end > orig_max:
+            # 波长 b 到维度索引的映射
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+
+            # 划分高低频段
+            low = max(math.floor(inv_dim(beta_fast)), 0)
+            high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+
+            # 线性插值缩放因子
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                / max(high - low, 1),
+                min=0.0,
+                max=1.0,
+            )
+            # 高频不变，低频缩放
+            freqs = freqs * (1 - ramp + ramp / factor)
+
+    # 位置索引
+    t = torch.arange(end, device=freqs.device).float()
+
+    # 外积：每个位置的旋转角度
+    freqs = torch.outer(t, freqs).float()
+
+    # 拼接成两倍维度（因为旋转需要 cos/sin 各一份）
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+
+    return freqs_cos, freqs_sin
+
+#编写RoPE
+# 编写RoPE
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    def rotate_half(x):
+        # x.shape[-1]取最后一个维度的重点
+        # x[..., x.shape[-1] // 2 :]取出x的后半部分
+        return torch.cat(
+            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
+        )
+    
+    # x_rotated = x * cos + rotate_half(x) * sin
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+    )
+    
+    return q_embed, k_embed
