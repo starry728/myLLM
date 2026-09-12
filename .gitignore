@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 模型权重 / 大文件
+*.bin
+*.safetensors
+*.gguf
+checkpoints/
+runs/
+logs/
+
+# 编辑器
+.vscode/
+
+# 系统
+.DS_Store
